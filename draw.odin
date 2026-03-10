@@ -1,0 +1,1645 @@
+package ion
+
+import "core:strings"
+import "base:runtime"
+import "core:fmt"
+import "core:math"
+import "core:math/linalg"
+import im "shared:odin-imgui"
+import gl "vendor:OpenGL"
+import b2 "vendor:box2d"
+import "vendor:glfw"
+
+
+Camera :: struct {
+	center :        b2.Vec2,
+	width, height : i32,
+	zoom :          f32,
+	rotation :      f32,
+}
+
+RGBA8 :: [4]u8
+
+make_rgba :: proc(color : b2.HexColor, alpha : f32) -> RGBA8 {
+	c := i32(color)
+	return {
+		u8((c >> 16) & 0xFF),
+		u8((c >> 8) & 0xFF),
+		u8(c & 0xFF),
+		u8(0xFF * alpha),
+	}
+}
+
+
+camera_reset_view :: proc(camera : ^Camera) {
+	camera.center = {0, 0}
+	camera.zoom = 1
+}
+
+
+camera_init :: proc() -> Camera {
+	c : Camera = {
+		width  = 1920,
+		height = 1080,
+	}
+	camera_reset_view(&c)
+	return c
+}
+
+//Takes in a vector that is screen's pixel coordinate and converts it to world's coordinate (according to the camera)
+camera_convert_screen_to_world_64 :: proc(
+	cam : ^Camera,
+	ps : [2]f64,
+) -> b2.Vec2 {
+	
+	ps_32 :[2]f32= {f32(ps.x), f32(ps.y)}
+	
+	return camera_convert_screen_to_world_32(cam, ps_32)
+
+}
+
+camera_convert_screen_to_world_32 :: proc(
+	cam : ^Camera,
+	ps : b2.Vec2,
+) -> b2.Vec2 {
+	
+	ps :[2]f32= {f32(ps.x), f32(ps.y)}
+
+	w := f32(cam.width)
+	h := f32(cam.height)
+	u := ps.x / w
+	v := (h - ps.y) / h
+
+	ratio := w / h
+	extents : b2.Vec2 = {cam.zoom * ratio, cam.zoom}
+
+	lower := cam.center - extents
+	upper := cam.center + extents
+
+	pw : b2.Vec2 = {
+		(1.0 - u) * lower.x + u * upper.x,
+		(1.0 - v) * lower.y + v * upper.y,
+	}
+	return pw
+}
+
+camera_convert_screen_to_world  :: proc {
+	camera_convert_screen_to_world_32,
+	camera_convert_screen_to_world_64
+}
+
+
+camera_convert_world_to_screen :: proc(
+	cam : ^Camera,
+	pw : b2.Vec2,
+) -> b2.Vec2 {
+	cam := cam
+	pw := pw
+
+	w := f32(cam.width)
+	h := f32(cam.height)
+
+	switch cam.rotation {
+	case 1 ..= 90, 180 ..= 270:
+		pw = swizzle(pw, 1, 0)
+		pw.y = -pw.y
+	case 180:
+		pw.y = -pw.y
+	}
+	ratio := w / h
+
+	extents : b2.Vec2 = {cam.zoom * ratio, cam.zoom}
+
+
+	rotated_pw := pw
+	lower := cam.center - extents
+	upper := cam.center + extents
+
+
+	u := (rotated_pw.x - lower.x) / (upper.x - lower.x)
+	v := (rotated_pw.y - lower.y) / (upper.y - lower.y)
+
+	ps : b2.Vec2 = {u * w, (1.0 - v) * h}
+	return ps
+}
+
+PI :: 3.14159265358979323846
+DEG2RAD :: PI / 180.0
+RAD2DEG :: 180.0 / PI
+
+
+//Convert from world coordinates to normalized device coordinates
+// http://www.songho.ca/opengl/gl_projectionmatrix.html
+camera_build_project_matrix :: proc(
+	cam : ^Camera,
+	z_bias : f32,
+) -> matrix[4, 4]f32 {
+
+	m : matrix[4, 4]f32
+
+	mat_rot := linalg.matrix4_rotate_f32(DEG2RAD * cam.rotation, {0, 0, 1})
+
+	ratio := f32(cam.width) / f32(cam.height)
+	extents : b2.Vec2 = {cam.zoom * ratio, cam.zoom}
+	lower := cam.center - extents
+	upper := cam.center + extents
+
+	w := upper.x - lower.x
+	h := upper.y - lower.y
+
+	m[0][0] = 2.0 / w
+	m[1][1] = 2.0 / h
+	m[2][2] = -1
+	m[3][0] = -2.0 * cam.center.x / w
+	m[3][1] = -2.0 * cam.center.y / h
+	m[3][2] = z_bias
+	m[3][3] = 1
+
+	return m * mat_rot
+}
+
+camera_get_view_bounds :: proc(cam : ^Camera) -> b2.AABB {
+	return b2.AABB {
+		lowerBound = camera_convert_screen_to_world(cam, b2.Vec2{0, f32(cam.height)}),
+		upperBound = camera_convert_screen_to_world(cam, b2.Vec2{f32(cam.width), 0}),
+	}
+}
+
+
+Background :: struct {
+	vao, vbo, program : u32,
+	uniforms :          gl.Uniforms,
+}
+
+check_opengl :: proc() {
+	err := gl.GetError()
+	if err != gl.NO_ERROR {
+		fmt.eprintf("OpenGL error = %d\n", err)
+		assert(false)
+	}
+}
+
+
+background_create :: proc(back : ^Background) {
+
+	ok : bool
+	back.program, ok = gl.load_shaders_source(
+		#load("shaders/background.vs"),
+		#load("shaders/background.fs"),
+	)
+	check_opengl()
+	back.uniforms = gl.get_uniforms_from_program(back.program)
+
+	vertex_attribute : u32
+
+	//Generate
+	gl.GenVertexArrays(1, &back.vao)
+	gl.GenBuffers(1, &back.vbo)
+
+	gl.BindVertexArray(back.vao)
+	gl.EnableVertexAttribArray(vertex_attribute)
+
+	//Single quad
+	vertices : [4]b2.Vec2 = {{-1.0, 1.0}, {-1.0, -1.0}, {1.0, 1.0}, {1.0, -1}}
+	gl.BindBuffer(gl.ARRAY_BUFFER, back.vbo)
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		size_of(vertices),
+		&vertices[0],
+		gl.STATIC_DRAW,
+	)
+	gl.VertexAttribPointer(vertex_attribute, 2, gl.FLOAT, false, 0, 0)
+
+	check_opengl()
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+}
+
+background_destroy :: proc(back : ^Background) {
+	if bool(back.vao) {
+		gl.DeleteVertexArrays(1, &back.vao)
+		gl.DeleteBuffers(1, &back.vbo)
+		back.vao = 0
+		back.vbo = 0
+	}
+
+	if bool(back.program) {
+		gl.DeleteProgram(back.program)
+		back.program = 0
+	}
+}
+
+background_draw :: proc(back : ^Background, cam : ^Camera) {
+	gl.UseProgram(back.program)
+
+	time := f32(glfw.GetTime())
+	time = math.mod_f32(time, f32(10.0))
+
+	gl.Uniform1f(back.uniforms["time"].location, time)
+	gl.Uniform2f(
+		back.uniforms["resolution"].location,
+		f32(cam.width),
+		f32(cam.height),
+	)
+
+	gl.Uniform3f(back.uniforms["baseColor"].location, 0.4, 0.4, 0.2)
+
+	gl.BindVertexArray(back.vao)
+	gl.BindBuffer(gl.ARRAY_BUFFER, back.vbo)
+	gl.DrawArrays(gl.TRIANGLE_STRIP, 0, 4)
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+	gl.UseProgram(0)
+}
+
+
+PointData :: struct {
+	pos :  b2.Vec2,
+	size : f32,
+	rgba : RGBA8,
+}
+
+Point :: struct {
+	vao, vbo, program : u32,
+	uniforms :          gl.Uniforms,
+	points :            [dynamic]PointData,
+}
+
+points_create :: proc(point : ^Point) {
+
+	vs : string = `
+	#version 330
+	uniform mat4 projectionMatrix;
+	layout(location = 0) in vec2 v_position;
+	layout(location = 1) in float v_size;
+	layout(location = 2) in vec4 v_color;
+	out vec4 f_color;
+	void main(void) {
+		f_color = v_color;
+		gl_Position = projectionMatrix * vec4(v_position, 0.0f, 1.0f);
+		gl_PointSize = v_size;
+	}
+	`
+
+	fs : string = `
+	#version 330
+	in vec4 f_color;
+	out vec4 color;
+	void main(void){
+		color = f_color;
+	}
+	`
+	point.program, _ = gl.load_shaders_source(vs, fs)
+	point.uniforms = gl.get_uniforms_from_program(point.program)
+
+	vertex_attribute : u32 = 0
+	size_attribute : u32 = 1
+	color_attribute : u32 = 2
+
+	gl.GenVertexArrays(1, &point.vao)
+	gl.GenBuffers(1, &point.vbo)
+
+	gl.BindVertexArray(point.vao)
+	gl.EnableVertexAttribArray(vertex_attribute)
+	gl.EnableVertexAttribArray(size_attribute)
+	gl.EnableVertexAttribArray(color_attribute)
+
+	//Vertex buffer
+	gl.BindBuffer(gl.ARRAY_BUFFER, point.vbo)
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		2048 * size_of(PointData),
+		nil,
+		gl.DYNAMIC_DRAW,
+	)
+
+	gl.VertexAttribPointer(
+		vertex_attribute,
+		2,
+		gl.FLOAT,
+		gl.FALSE,
+		size_of(PointData),
+		offset_of(PointData, pos),
+	)
+
+	gl.VertexAttribPointer(
+		size_attribute,
+		1,
+		gl.FLOAT,
+		gl.FALSE,
+		size_of(PointData),
+		offset_of(PointData, size),
+	)
+
+	gl.VertexAttribPointer(
+		color_attribute,
+		4,
+		gl.UNSIGNED_BYTE,
+		gl.TRUE,
+		size_of(PointData),
+		offset_of(PointData, rgba),
+	)
+
+	check_opengl()
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+
+}
+
+points_destroy :: proc(point : ^Point) {
+	if point.vao != 0 {
+		gl.DeleteVertexArrays(1, &point.vao)
+		gl.DeleteBuffers(1, &point.vbo)
+		point.vao = 0
+		point.vbo = 0
+	}
+
+	if point.program != 0 {
+		gl.DeleteProgram(point.program)
+		point.program = 0
+	}
+}
+
+points_add :: proc(point : ^Point, v : b2.Vec2, size : f32, c : b2.HexColor) {
+	rgba := make_rgba(c, 1.0)
+	append(&point.points, PointData{v, size, rgba})
+}
+
+//Flush means draw
+points_flush :: proc(point : ^Point, cam : ^Camera) {
+	count := i32(len(point.points))
+	if count == 0 do return
+
+	gl.UseProgram(point.program)
+
+	proj := camera_build_project_matrix(cam, 0)
+
+	gl.UniformMatrix4fv(
+		point.uniforms["projectionMatrix"].location,
+		1,
+		gl.FALSE,
+		&proj[0][0],
+	)
+
+	gl.BindVertexArray(point.vao)
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, point.vbo)
+	gl.Enable(gl.PROGRAM_POINT_SIZE)
+
+	base := 0
+
+	for count > 0 {
+		batch_count : i32 = min(count, 2048)
+
+		gl.BufferSubData(
+			gl.ARRAY_BUFFER,
+			0,
+			int(batch_count * size_of(PointData)),
+			&point.points[base],
+		)
+		gl.DrawArrays(gl.POINTS, 0, batch_count)
+
+		check_opengl()
+
+		count -= 2048
+		base += 2048
+	}
+
+	gl.Disable(gl.PROGRAM_POINT_SIZE)
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+	gl.UseProgram(0)
+
+	clear(&point.points)
+}
+
+VertexData :: struct {
+	pos :  b2.Vec2,
+	rgba : RGBA8,
+}
+
+Lines :: struct {
+	points :            [dynamic]VertexData,
+	vao, vbo, program : u32,
+	uniforms :          gl.Uniforms,
+}
+
+
+lines_create :: proc(line : ^Lines) {
+
+	vs : string = `
+		#version 330
+		uniform mat4 projectionMatrix;
+		layout(location = 0) in vec2 v_position;
+		layout(location = 1) in vec4 v_color;
+		out vec4 f_color;
+
+		void main(void){
+			f_color = v_color;
+			gl_Position = projectionMatrix * vec4(v_position , 0.0f, 1.0f);
+		}
+	`
+
+	fs : string = `
+		#version 330
+		in vec4 f_color;
+		out vec4 color;
+
+		void main(void){
+			color = f_color;
+		}
+	`
+
+	ok := false
+	line.program, ok = gl.load_shaders_source(vs, fs)
+	check_opengl()
+	line.uniforms = gl.get_uniforms_from_program(line.program)
+
+	vertex_attribute : u32 = 0
+	color_attribute : u32 = 1
+
+	gl.GenVertexArrays(1, &line.vao)
+	gl.GenBuffers(1, &line.vbo)
+
+	gl.BindVertexArray(line.vao)
+	gl.EnableVertexAttribArray(vertex_attribute)
+	gl.EnableVertexAttribArray(color_attribute)
+
+	//Vertex buffer
+	gl.BindBuffer(gl.ARRAY_BUFFER, line.vbo)
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		2048 * size_of(VertexData),
+		nil,
+		gl.DYNAMIC_DRAW,
+	)
+
+	gl.VertexAttribPointer(
+		vertex_attribute,
+		2,
+		gl.FLOAT,
+		gl.FALSE,
+		size_of(VertexData),
+		offset_of(VertexData, pos),
+	)
+	gl.VertexAttribPointer(
+		color_attribute,
+		4,
+		gl.UNSIGNED_BYTE,
+		gl.TRUE,
+		size_of(VertexData),
+		offset_of(VertexData, rgba),
+	)
+	check_opengl()
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+}
+
+lines_destroy :: proc(line : ^Lines) {
+	if line.vao != 0 {
+		gl.DeleteVertexArrays(1, &line.vao)
+		gl.DeleteBuffers(1, &line.vbo)
+		line.vao = 0
+		line.vbo = 0
+	}
+
+	if line.program != 0 {
+		gl.DeleteProgram(line.program)
+		line.program = 0
+	}
+}
+
+
+lines_add :: proc(line : ^Lines, p1, p2 : b2.Vec2, c : b2.HexColor) {
+	rgba := make_rgba(c, 1.0)
+	append(&line.points, VertexData{p1, rgba})
+	append(&line.points, VertexData{p2, rgba})
+}
+
+
+lines_flush :: proc(line : ^Lines, cam : ^Camera) {
+	count := i32(len(line.points))
+
+	batch_size : i32 = 2 * 2048
+
+	if count == 0 do return
+
+	gl.Enable(gl.BLEND)
+	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+
+	gl.UseProgram(line.program)
+
+	proj := camera_build_project_matrix(cam, 0.1)
+
+	gl.UniformMatrix4fv(
+		line.uniforms["projectionMatrix"].location,
+		1,
+		gl.FALSE,
+		&proj[0][0],
+	)
+	gl.BindVertexArray(line.vao)
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, line.vbo)
+
+	base : i32 = 0
+
+	for count > 0 {
+		batch_count := min(count, batch_size)
+		size := int(batch_count * size_of(VertexData))
+		gl.BufferSubData(gl.ARRAY_BUFFER, 0, size, &line.points[base])
+		gl.DrawArrays(gl.LINES, 0, batch_count)
+		check_opengl()
+
+		count -= batch_size
+		base += batch_size
+	}
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+	gl.UseProgram(0)
+	gl.Disable(gl.BLEND)
+	clear(&line.points)
+}
+
+
+CircleData :: struct {
+	pos :    b2.Vec2,
+	radius : f32,
+	rgba :   RGBA8,
+}
+
+Circles :: struct {
+	circles :      [dynamic]CircleData,
+	vao, program : u32,
+	vbos :         [2]u32,
+	uniforms :     gl.Uniforms,
+}
+
+
+circle_create :: proc(circle : ^Circles) {
+
+	batch_size := 2048
+
+	circle.program, _ = gl.load_shaders_source(
+		#load("shaders/circle.vs"),
+		#load("shaders/circle.fs"),
+	)
+	check_opengl()
+	circle.uniforms = gl.get_uniforms_from_program(circle.program)
+
+	vertex_attribute : u32 = 0
+	position_instance : u32 = 1
+	radiusInstance : u32 = 2
+	colorInstance : u32 = 3
+
+	gl.GenVertexArrays(1, &circle.vao)
+	gl.GenBuffers(2, &circle.vbos[0])
+
+	gl.BindVertexArray(circle.vao)
+	gl.EnableVertexAttribArray(vertex_attribute)
+	gl.EnableVertexAttribArray(position_instance)
+	gl.EnableVertexAttribArray(radiusInstance)
+	gl.EnableVertexAttribArray(colorInstance)
+
+	//vertex buffer for single quad
+	a : f32 = 1.1
+
+	vertices : []b2.Vec2 = {
+		{-a, -a},
+		{a, -a},
+		{-a, a},
+		{a, -a},
+		{a, a},
+		{-a, a},
+	}
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, circle.vbos[0])
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		size_of(b2.Vec2) * 6,
+		&vertices[0],
+		gl.STATIC_DRAW,
+	)
+	gl.VertexAttribPointer(vertex_attribute, 2, gl.FLOAT, gl.FALSE, 0, 0)
+
+	//
+	gl.BindBuffer(gl.ARRAY_BUFFER, circle.vbos[1])
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		batch_size * size_of(CircleData),
+		nil,
+		gl.DYNAMIC_DRAW,
+	)
+
+	gl.VertexAttribPointer(
+		position_instance,
+		2,
+		gl.FLOAT,
+		gl.FALSE,
+		size_of(CircleData),
+		offset_of(CircleData, pos),
+	)
+	gl.VertexAttribPointer(
+		radiusInstance,
+		1,
+		gl.FLOAT,
+		gl.FALSE,
+		size_of(CircleData),
+		offset_of(CircleData, radius),
+	)
+	gl.VertexAttribPointer(
+		colorInstance,
+		4,
+		gl.UNSIGNED_BYTE,
+		gl.TRUE,
+		size_of(CircleData),
+		offset_of(CircleData, rgba),
+	)
+
+	gl.VertexAttribDivisor(position_instance, 1)
+	gl.VertexAttribDivisor(radiusInstance, 1)
+	gl.VertexAttribDivisor(colorInstance, 1)
+
+	check_opengl()
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+}
+
+circle_destroy :: proc(circle : ^Circles) {
+	if circle.vao != 0 {
+		gl.DeleteVertexArrays(1, &circle.vao)
+		gl.DeleteBuffers(2, &circle.vbos[0])
+		circle.vao = 0
+		circle.vbos[0] = 0
+		circle.vbos[1] = 0
+	}
+
+	if circle.program != 0 {
+		gl.DeleteProgram(circle.program)
+		circle.program = 0
+	}
+}
+
+circle_add :: proc(
+	circle : ^Circles,
+	center : b2.Vec2,
+	radius : f32,
+	color : b2.HexColor,
+) {
+	rgba := make_rgba(color, 1.0)
+	append(&circle.circles, CircleData{center, radius, rgba})
+}
+
+circle_flush :: proc(circle : ^Circles, cam : ^Camera) {
+	count := i32(len(circle.circles))
+	if count == 0 do return
+	batch_size : i32 = 2048
+
+	gl.UseProgram(circle.program)
+
+	proj := camera_build_project_matrix(cam, 0.2)
+
+	gl.UniformMatrix4fv(
+		circle.uniforms["projectionMatrix"].location,
+		1,
+		gl.FALSE,
+		&proj[0][0],
+	)
+	gl.Uniform1f(
+		circle.uniforms["pixelScale"].location,
+		f32(cam.height) / cam.zoom,
+	)
+
+	gl.BindVertexArray(circle.vao)
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, circle.vbos[1])
+	gl.Enable(gl.BLEND)
+	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+
+	base : i32 = 0
+
+	for count > 0 {
+		batch_count := min(count, batch_size)
+
+		gl.BufferSubData(
+			gl.ARRAY_BUFFER,
+			0,
+			int(batch_count * size_of(CircleData)),
+			&circle.circles[base],
+		)
+		gl.DrawArraysInstanced(gl.TRIANGLES, 0, 6, batch_count)
+
+		check_opengl()
+
+		count -= batch_size
+		base += batch_size
+	}
+
+	gl.Disable(gl.BLEND)
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+	gl.UseProgram(0)
+
+	clear(&circle.circles)
+}
+
+
+SolidCircleData :: struct {
+	transform : b2.Transform,
+	radius :    f32,
+	rgba :      RGBA8,
+}
+
+SolidCircle :: struct {
+	circles :      [dynamic]SolidCircleData,
+	program, vao : u32,
+	vbo :          [2]u32,
+	uniforms :     gl.Uniforms,
+}
+
+
+solid_circle_create :: proc(circle : ^SolidCircle) {
+	circle.program, _ = gl.load_shaders_source(
+		#load("shaders/solid_circle.vs"),
+		#load("shaders/solid_circle.fs"),
+	)
+	circle.uniforms = gl.get_uniforms_from_program(circle.program)
+
+	gl.GenVertexArrays(1, &circle.vao)
+	gl.GenBuffers(2, &circle.vbo[0])
+
+	gl.BindVertexArray(circle.vao)
+
+	vertex_attribute : u32 = 0
+	transform_instance : u32 = 1
+	radius_instance : u32 = 2
+	color_instance : u32 = 3
+
+	gl.EnableVertexAttribArray(vertex_attribute)
+	gl.EnableVertexAttribArray(transform_instance)
+	gl.EnableVertexAttribArray(radius_instance)
+	gl.EnableVertexAttribArray(color_instance)
+
+	batch_size : i32 = 2048
+
+	//Vertex buffer for single quad
+	a : f32 = 1.1
+
+	vertices : []b2.Vec2 = {
+		{-a, -a},
+		{a, -a},
+		{-a, a},
+		{a, -a},
+		{a, a},
+		{-a, a},
+	}
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, circle.vbo[0])
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		size_of(b2.Vec2) * 6,
+		&vertices[0],
+		gl.STATIC_DRAW,
+	)
+	gl.VertexAttribPointer(vertex_attribute, 2, gl.FLOAT, gl.FALSE, 0, 0)
+
+	//
+	gl.BindBuffer(gl.ARRAY_BUFFER, circle.vbo[1])
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		int(batch_size * size_of(SolidCircleData)),
+		nil,
+		gl.DYNAMIC_DRAW,
+	)
+
+	gl.VertexAttribPointer(
+		transform_instance,
+		4,
+		gl.FLOAT,
+		gl.FALSE,
+		size_of(SolidCircleData),
+		offset_of(SolidCircleData, transform),
+	)
+	gl.VertexAttribPointer(
+		radius_instance,
+		1,
+		gl.FLOAT,
+		gl.FALSE,
+		size_of(SolidCircleData),
+		offset_of(SolidCircleData, radius),
+	)
+	gl.VertexAttribPointer(
+		color_instance,
+		4,
+		gl.UNSIGNED_BYTE,
+		gl.TRUE,
+		size_of(SolidCircleData),
+		offset_of(SolidCircleData, rgba),
+	)
+
+	gl.VertexAttribDivisor(transform_instance, 1)
+	gl.VertexAttribDivisor(radius_instance, 1)
+	gl.VertexAttribDivisor(color_instance, 1)
+
+	check_opengl()
+
+	//Cleanup
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+}
+
+solid_circle_destroy :: proc(circle : ^SolidCircle) {
+	if circle.vao != 0 {
+		gl.DeleteVertexArrays(1, &circle.vao)
+		gl.DeleteBuffers(2, &circle.vbo[0])
+		circle.vao = 0
+		circle.vbo[0] = 0
+		circle.vbo[1] = 0
+	}
+
+	if circle.program != 0 {
+		gl.DeleteProgram(circle.program)
+		circle.program = 0
+	}
+}
+
+solid_circle_add :: proc(
+	circle : ^SolidCircle,
+	transform : b2.Transform,
+	radius : f32,
+	color : b2.HexColor,
+) {
+	rgba := make_rgba(color, 1.0)
+	append(&circle.circles, SolidCircleData{transform, radius, rgba})
+}
+
+solid_circle_flush :: proc(circle : ^SolidCircle, cam : ^Camera) {
+	count : i32 = i32(len(circle.circles))
+	if count == 0 do return
+	batch_size : i32 = 2048
+
+	gl.UseProgram(circle.program)
+
+	proj := camera_build_project_matrix(cam, 0.2)
+
+	gl.UniformMatrix4fv(
+		circle.uniforms["projectionMatrix"].location,
+		1,
+		gl.FALSE,
+		&proj[0][0],
+	)
+	gl.Uniform1f(
+		circle.uniforms["pixelScale"].location,
+		f32(cam.height) / cam.zoom,
+	)
+
+	gl.BindVertexArray(circle.vao)
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, circle.vbo[1])
+	gl.Enable(gl.BLEND)
+	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+
+	base : i32 = 0
+
+	for count > 0 {
+		batch_count := min(count, batch_size)
+
+		gl.BufferSubData(
+			gl.ARRAY_BUFFER,
+			0,
+			int(batch_count * size_of(SolidCircleData)),
+			&circle.circles[base],
+		)
+		gl.DrawArraysInstanced(gl.TRIANGLES, 0, 6, batch_count)
+
+		check_opengl()
+
+		count -= batch_size
+		base += batch_size
+	}
+
+	gl.Disable(gl.BLEND)
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+	gl.UseProgram(0)
+
+	clear(&circle.circles)
+}
+
+
+CapsuleData :: struct {
+	transform :      b2.Transform,
+	radius, length : f32,
+	rgba :           RGBA8,
+}
+
+
+SolidCapsules :: struct {
+	capsules :     [dynamic]CapsuleData,
+	vao, program : u32,
+	vbo :          [2]u32,
+	uniforms :     gl.Uniforms,
+}
+
+
+//Draw capsules using SDF-based shaders
+
+solid_capsules_create :: proc(capsule : ^SolidCapsules) {
+	capsule.program, _ = gl.load_shaders_source(
+		#load("shaders/solid_capsule.vs"),
+		#load("shaders/solid_capsule.fs"),
+	)
+	check_opengl()
+	capsule.uniforms = gl.get_uniforms_from_program(capsule.program)
+
+
+	//batch_size := i32(len(capsules))
+	batch_size : i32 = 512
+
+
+	vertex_attribute : u32 = 0
+	transform_instance : u32 = 1
+	radius_instance : u32 = 2
+	length_instance : u32 = 3
+	color_instance : u32 = 4
+
+	gl.GenVertexArrays(1, &capsule.vao)
+	gl.GenBuffers(2, &capsule.vbo[0])
+
+	gl.BindVertexArray(capsule.vao)
+
+	gl.EnableVertexAttribArray(vertex_attribute)
+	gl.EnableVertexAttribArray(transform_instance)
+	gl.EnableVertexAttribArray(radius_instance)
+	gl.EnableVertexAttribArray(length_instance)
+	gl.EnableVertexAttribArray(color_instance)
+
+	//Vertex buffer for single quad
+	a : f32 = 1.1
+
+	vertices : []b2.Vec2 = {
+		{-a, -a},
+		{a, -a},
+		{-a, a},
+		{a, -a},
+		{a, a},
+		{-a, a},
+	}
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, capsule.vbo[0])
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		size_of(b2.Vec2) * 6,
+		&vertices[0],
+		gl.STATIC_DRAW,
+	)
+	gl.VertexAttribPointer(vertex_attribute, 2, gl.FLOAT, gl.FALSE, 0, 0)
+
+	//
+	gl.BindBuffer(gl.ARRAY_BUFFER, capsule.vbo[1])
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		int(batch_size * size_of(CapsuleData)),
+		nil,
+		gl.DYNAMIC_DRAW,
+	)
+
+	gl.VertexAttribPointer(
+		transform_instance,
+		4,
+		gl.FLOAT,
+		gl.FALSE,
+		size_of(CapsuleData),
+		offset_of(CapsuleData, transform),
+	)
+	gl.VertexAttribPointer(
+		radius_instance,
+		1,
+		gl.FLOAT,
+		gl.FALSE,
+		size_of(CapsuleData),
+		offset_of(CapsuleData, radius),
+	)
+	gl.VertexAttribPointer(
+		length_instance,
+		1,
+		gl.FLOAT,
+		gl.FALSE,
+		size_of(CapsuleData),
+		offset_of(CapsuleData, length),
+	)
+	gl.VertexAttribPointer(
+		color_instance,
+		4,
+		gl.UNSIGNED_BYTE,
+		gl.TRUE,
+		size_of(CapsuleData),
+		offset_of(CapsuleData, rgba),
+	)
+
+	gl.VertexAttribDivisor(transform_instance, 1)
+	gl.VertexAttribDivisor(radius_instance, 1)
+	gl.VertexAttribDivisor(length_instance, 1)
+	gl.VertexAttribDivisor(color_instance, 1)
+
+	check_opengl()
+
+	//Cleanup
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+}
+
+solid_capsules_destroy :: proc(capsule : ^SolidCapsules) {
+	if capsule.vao != 0 {
+		gl.DeleteVertexArrays(1, &capsule.vao)
+		gl.DeleteBuffers(2, &capsule.vbo[0])
+		capsule.vao = 0
+		capsule.vbo = {0, 0}
+	}
+
+	if capsule.program != 0 {
+		gl.DeleteProgram(capsule.program)
+		capsule.program = 0
+	}
+}
+
+solid_capsules_add :: proc(
+	capsule : ^SolidCapsules,
+	p1, p2 : b2.Vec2,
+	radius : f32,
+	c : b2.HexColor,
+) {
+	d := p2 - p1
+
+	length := b2.Length(d)
+	if length < 0.001 do return
+
+	axis := d / length
+
+	transform : b2.Transform = {
+		p = 0.5 * (p1 + p2),
+		q = {c = axis.x, s = axis.y},
+	}
+
+	rgba := make_rgba(c, 1.0)
+
+	append(&capsule.capsules, CapsuleData{transform, radius, length, rgba})
+}
+
+solid_capsules_flush :: proc(capsule : ^SolidCapsules, cam : ^Camera) {
+	count := i32(len(capsule.capsules))
+
+	if count == 0 do return
+
+	//batch :i32= 2048
+
+	gl.UseProgram(capsule.program)
+
+	proj := camera_build_project_matrix(cam, 0.2)
+
+	gl.UniformMatrix4fv(
+		capsule.uniforms["projectionMatrix"].location,
+		1,
+		gl.FALSE,
+		&proj[0][0],
+	)
+	gl.Uniform1f(
+		capsule.uniforms["pixelScale"].location,
+		f32(cam.height) / cam.zoom,
+	)
+
+	gl.BindVertexArray(capsule.vao)
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, capsule.vbo[1])
+	gl.Enable(gl.BLEND)
+	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+
+	base : i32 = 0
+
+	for count > 0 {
+		batch_count := min(count, 2048)
+		//fmt.println(size_of(capsules[0]))
+
+		gl.BufferSubData(
+			gl.ARRAY_BUFFER,
+			0,
+			int(batch_count * size_of(CapsuleData)),
+			&capsule.capsules[base],
+		)
+		gl.DrawArraysInstanced(gl.TRIANGLES, 0, 6, batch_count)
+
+		check_opengl()
+
+		count -= 2048
+		base += 2048
+	}
+
+	gl.Disable(gl.BLEND)
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+	gl.UseProgram(0)
+
+	clear(&capsule.capsules)
+}
+
+
+PolygonData :: struct #packed {
+	transform :                      b2.Transform,
+	p1, p2, p3, p4, p5, p6, p7, p8 : b2.Vec2,
+	count :                          i32,
+	radius :                         f32,
+
+	//Keep color small
+	color :                          RGBA8,
+}
+
+SolidPolygon :: struct {
+	polygons :     [dynamic]PolygonData,
+	vao, program : u32,
+	vbo :          [2]u32,
+	uniforms :     gl.Uniforms,
+}
+
+
+solid_polygon_create :: proc(polygon : ^SolidPolygon) {
+	polygon.program, _ = gl.load_shaders_source(
+		#load("shaders/solid_polygons.vs"),
+		#load("shaders/solid_polygons.fs"),
+	)
+
+	batch_size : i32 = 512
+
+	polygon.uniforms = gl.get_uniforms_from_program(polygon.program)
+
+	vertex_attribute : u32 = 0
+	instance_transform : u32 = 1
+	instance_point12 : u32 = 2
+	instance_point34 : u32 = 3
+	instance_point56 : u32 = 4
+	instance_point78 : u32 = 5
+	instance_point_count : u32 = 6
+	instance_radius : u32 = 7
+	instance_color : u32 = 8
+
+
+	gl.GenVertexArrays(1, &polygon.vao)
+	gl.GenBuffers(2, &polygon.vbo[0])
+
+	gl.BindVertexArray(polygon.vao)
+
+	gl.EnableVertexAttribArray(vertex_attribute)
+	gl.EnableVertexAttribArray(instance_transform)
+	gl.EnableVertexAttribArray(instance_point12)
+	gl.EnableVertexAttribArray(instance_point34)
+	gl.EnableVertexAttribArray(instance_point56)
+	gl.EnableVertexAttribArray(instance_point78)
+	gl.EnableVertexAttribArray(instance_point_count)
+	gl.EnableVertexAttribArray(instance_radius)
+	gl.EnableVertexAttribArray(instance_color)
+
+	a : f32 = 1.1
+
+	vertices : []b2.Vec2 = {
+		{-a, -a},
+		{a, -a},
+		{-a, a},
+		{a, -a},
+		{a, a},
+		{-a, a},
+	}
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, polygon.vbo[0])
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		size_of(b2.Vec2) * 6,
+		&vertices[0],
+		gl.STATIC_DRAW,
+	)
+	gl.VertexAttribPointer(vertex_attribute, 2, gl.FLOAT, gl.FALSE, 0, 0)
+
+	//
+	gl.BindBuffer(gl.ARRAY_BUFFER, polygon.vbo[1])
+	gl.BufferData(
+		gl.ARRAY_BUFFER,
+		int(batch_size * size_of(PolygonData)),
+		nil,
+		gl.DYNAMIC_DRAW,
+	)
+
+	gl.VertexAttribPointer(
+		instance_transform,
+		4,
+		gl.FLOAT,
+		false,
+		size_of(PolygonData),
+		offset_of(PolygonData, transform),
+	)
+	gl.VertexAttribPointer(
+		instance_point12,
+		4,
+		gl.FLOAT,
+		false,
+		size_of(PolygonData),
+		offset_of(PolygonData, p1),
+	)
+	gl.VertexAttribPointer(
+		instance_point34,
+		4,
+		gl.FLOAT,
+		false,
+		size_of(PolygonData),
+		offset_of(PolygonData, p3),
+	)
+	gl.VertexAttribPointer(
+		instance_point56,
+		4,
+		gl.FLOAT,
+		false,
+		size_of(PolygonData),
+		offset_of(PolygonData, p5),
+	)
+	gl.VertexAttribPointer(
+		instance_point78,
+		4,
+		gl.FLOAT,
+		false,
+		size_of(PolygonData),
+		offset_of(PolygonData, p7),
+	)
+	gl.VertexAttribIPointer(
+		instance_point_count,
+		1,
+		gl.INT,
+		size_of(PolygonData),
+		offset_of(PolygonData, count),
+	)
+	gl.VertexAttribPointer(
+		instance_radius,
+		1,
+		gl.FLOAT,
+		false,
+		size_of(PolygonData),
+		offset_of(PolygonData, radius),
+	)
+	gl.VertexAttribPointer(
+		instance_color,
+		4,
+		gl.UNSIGNED_BYTE,
+		true,
+		size_of(PolygonData),
+		offset_of(PolygonData, color),
+	)
+
+
+	gl.VertexAttribDivisor(instance_transform, 1)
+	gl.VertexAttribDivisor(instance_point12, 1)
+	gl.VertexAttribDivisor(instance_point34, 1)
+	gl.VertexAttribDivisor(instance_point56, 1)
+	gl.VertexAttribDivisor(instance_point78, 1)
+	gl.VertexAttribDivisor(instance_point_count, 1)
+	gl.VertexAttribDivisor(instance_radius, 1)
+	gl.VertexAttribDivisor(instance_color, 1)
+
+	check_opengl()
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+
+}
+
+solid_polygon_add :: proc(
+	polygon : ^SolidPolygon,
+	transform : b2.Transform,
+	points : [^]b2.Vec2,
+	count : i32,
+	radius : f32,
+	color : b2.HexColor,
+) {
+
+	data : PolygonData
+
+	data.transform = transform
+
+	n := min(count, 8)
+
+	ps := cast([^]b2.Vec2)&data.p1
+
+	for i in 0 ..< count {
+		//fmt.print(points[i])
+		ps[i] = points[i]
+	}
+
+	data.count = n
+	data.radius = f32(radius)
+	data.color = make_rgba(color, 1.0)
+
+	append(&polygon.polygons, data)
+}
+
+
+solid_polygon_flush :: proc(polygon : ^SolidPolygon, cam : ^Camera) {
+	count := i32(len(polygon.polygons))
+
+	if count == 0 do return
+
+	batch_size : i32 = 512
+
+	gl.UseProgram(polygon.program)
+
+	proj := camera_build_project_matrix(cam, 0.2)
+
+	gl.UniformMatrix4fv(
+		polygon.uniforms["projectionMatrix"].location,
+		1,
+		gl.FALSE,
+		&proj[0][0],
+	)
+	gl.Uniform1f(
+		polygon.uniforms["pixelScale"].location,
+		f32(cam.height) / cam.zoom,
+	)
+
+	gl.BindVertexArray(polygon.vao)
+
+	gl.BindBuffer(gl.ARRAY_BUFFER, polygon.vbo[1])
+	gl.Enable(gl.BLEND)
+	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+
+	base : i32 = 0
+
+	for count > 0 {
+		batch_count := min(count, batch_size)
+
+		gl.BufferSubData(
+			gl.ARRAY_BUFFER,
+			0,
+			int(batch_count * size_of(PolygonData)),
+			&polygon.polygons[base],
+		)
+		gl.DrawArraysInstanced(gl.TRIANGLES, 0, 6, batch_count)
+
+		check_opengl()
+
+		count -= batch_size
+		base += batch_size
+	}
+
+	gl.Disable(gl.BLEND)
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+	gl.BindVertexArray(0)
+	gl.UseProgram(0)
+
+	clear(&polygon.polygons)
+
+}
+
+
+Draw :: struct {
+	show_ui :        bool,
+	debug_draw :     b2.DebugDraw,
+	cam :            Camera,
+	background :     Background,
+	points :         Point,
+	lines :          Lines,
+	circles :        Circles,
+	solid_circles :  SolidCircle,
+	solid_capsules : SolidCapsules,
+	polygons :       SolidPolygon,
+	drawCounters :   bool,
+	regular_font :   im.Font,
+	frame_buffer :   u32,
+}
+
+draw_aabb :: proc(draw : ^Draw, aabb : b2.AABB, c : b2.HexColor) {
+	p1 := aabb.lowerBound
+	p2 : [2]f32 = {aabb.upperBound.x, aabb.lowerBound.y}
+
+	p3 := aabb.upperBound
+	p4 : [2]f32 = {aabb.lowerBound.x, aabb.upperBound.y}
+
+	lines_add(&draw.lines, p1, p2, c)
+	lines_add(&draw.lines, p2, p3, c)
+	lines_add(&draw.lines, p3, p4, c)
+	lines_add(&draw.lines, p4, p1, c)
+}
+
+DrawPolygonFcn :: proc "c" (
+	vertices : [^]b2.Vec2,
+	vertexCount : i32,
+	color : b2.HexColor,
+	ctx : rawptr,
+) {
+
+	context = runtime.default_context()
+	draw : ^Draw = cast(^Draw)ctx
+
+	p1 := vertices[vertexCount - 1]
+	for i in 0 ..< vertexCount {
+		p2 := vertices[i]
+		lines_add(&draw.lines, p1, vertices[i], color)
+		p1 = p2
+	}
+}
+
+DrawSolidPolygonFcn :: proc "c" (
+	transform : b2.Transform,
+	vertices : [^]b2.Vec2,
+	vertexCount : i32,
+	radius : f32,
+	color : b2.HexColor,
+	ctx : rawptr,
+) {
+
+
+	context = runtime.default_context()
+
+	draw : ^Draw = cast(^Draw)ctx
+	solid_polygon_add(
+		&draw.polygons,
+		transform,
+		vertices,
+		vertexCount,
+		radius,
+		color,
+	)
+}
+
+
+DrawCircleFcn :: proc "c" (
+	center : b2.Vec2,
+	radius : f32,
+	color : b2.HexColor,
+	ctx : rawptr,
+) {
+	context = runtime.default_context()
+	draw : ^Draw = cast(^Draw)ctx
+	circle_add(&draw.circles, center, radius, color)
+}
+
+DrawSolidCircle :: proc(
+	circle : ^SolidCircle,
+	transform : b2.Transform,
+	center : b2.Vec2,
+	radius : f32,
+	color : b2.HexColor,
+) {
+	context = runtime.default_context()
+
+	transform := transform
+
+	transform.p = b2.TransformPoint(transform, center)
+	solid_circle_add(circle, transform, radius, color)
+}
+
+DrawTransform :: proc "c" (lines : ^Lines, transform : b2.Transform) {
+	context = runtime.default_context()
+	k_axis_scale : f32 = 0.2
+	p1 := transform.p
+
+	p2 := p1 + k_axis_scale * b2.Rot_GetXAxis(transform.q)
+	lines_add(lines, p1, p2, b2.HexColor.Red)
+
+	p2 = p1 + k_axis_scale * b2.Rot_GetYAxis(transform.q)
+	lines_add(lines, p1, p2, b2.HexColor.Green)
+}
+
+DrawSolidCircleFcn :: proc "c" (
+	transform : b2.Transform,
+	radius : f32,
+	color : b2.HexColor,
+	ctx : rawptr,
+) {
+	context = runtime.default_context()
+	draw : ^Draw = cast(^Draw)ctx
+	DrawSolidCircle(
+		&draw.solid_circles,
+		transform,
+		b2.Vec2_zero,
+		radius,
+		color,
+	)
+}
+
+DrawSolidCapsuleFcn :: proc "c" (
+	p1, p2 : b2.Vec2,
+	radius : f32,
+	color : b2.HexColor,
+	ctx : rawptr,
+) {
+	context = runtime.default_context()
+	draw : ^Draw = cast(^Draw)ctx
+	solid_capsules_add(&draw.solid_capsules, p1, p2, radius, color)
+}
+
+DrawSegmentFcn :: proc "c" (
+	p1, p2 : b2.Vec2,
+	color : b2.HexColor,
+	ctx : rawptr,
+) {
+	context = runtime.default_context()
+	draw : ^Draw = cast(^Draw)ctx
+	lines_add(&draw.lines, p1, p2, color)
+}
+
+DrawTransformFcn :: proc "c" (transform : b2.Transform, ctx : rawptr) {
+	context = runtime.default_context()
+	draw : ^Draw = cast(^Draw)ctx
+	DrawTransform(&draw.lines, transform)
+}
+
+DrawPointFcn :: proc "c" (
+	p : b2.Vec2,
+	size : f32,
+	color : b2.HexColor,
+	ctx : rawptr,
+) {
+	context = runtime.default_context()
+	draw : ^Draw = cast(^Draw)ctx
+	points_add(&draw.points, p, size, color)
+}
+
+DrawString :: proc(draw : ^Draw, x, y : int, str: cstring) 
+{
+	draw_list := im.GetForegroundDrawList()
+	im.DrawList_AddText(draw_list, {f32(x), f32(y)},im.GetColorU32(.Text), str)
+}
+
+DrawStringVec :: proc(draw : ^Draw, p : b2.Vec2, str: cstring) 
+{
+	ps := camera_convert_world_to_screen(&draw.cam, p)
+	im.DrawList_AddText(im.GetForegroundDrawList(), ps,im.GetColorU32(.Text), str)
+}
+
+DrawStringFcn :: proc "c" (
+	p : b2.Vec2,
+	s : cstring,
+	color : b2.HexColor,
+	ctx : rawptr,
+) {
+	context = runtime.default_context()
+	draw : ^Draw = cast(^Draw)ctx
+	DrawStringVec(draw, p, s)
+}
+
+draw_flush :: proc(draw : ^Draw) {
+	
+	background_draw(&draw.background, &draw.cam)
+
+	solid_circle_flush(&draw.solid_circles, &draw.cam)
+	solid_polygon_flush(&draw.polygons, &draw.cam)
+	solid_capsules_flush(&draw.solid_capsules, &draw.cam)
+	circle_flush(&draw.circles, &draw.cam)
+	lines_flush(&draw.lines, &draw.cam)
+	points_flush(&draw.points, &draw.cam)
+
+
+	check_opengl()
+}
+
+draw_create :: proc(draw : ^Draw, camera : ^Camera) {
+
+	background_create(&draw.background)
+	points_create(&draw.points)
+	solid_capsules_create(&draw.solid_capsules)
+	lines_create(&draw.lines)
+	circle_create(&draw.circles)
+	solid_circle_create(&draw.solid_circles)
+	solid_polygon_create(&draw.polygons)
+
+
+	bounds : b2.AABB = {{-max(f32), -max(f32)}, {max(f32), max(f32)}}
+
+	draw.debug_draw.DrawPolygonFcn = DrawPolygonFcn
+	draw.debug_draw.DrawSolidPolygonFcn = DrawSolidPolygonFcn
+	draw.debug_draw.DrawCircleFcn = DrawCircleFcn
+	draw.debug_draw.DrawSolidCircleFcn = DrawSolidCircleFcn
+	draw.debug_draw.DrawSolidCapsuleFcn = DrawSolidCapsuleFcn
+	draw.debug_draw.DrawSegmentFcn = DrawSegmentFcn
+	draw.debug_draw.DrawTransformFcn = DrawTransformFcn
+	draw.debug_draw.DrawPointFcn = DrawPointFcn
+	draw.debug_draw.DrawStringFcn = DrawStringFcn
+	draw.debug_draw.drawingBounds = bounds
+
+	draw.debug_draw.useDrawingBounds = false
+	draw.debug_draw.drawShapes = true
+	draw.debug_draw.drawJoints = true
+	draw.debug_draw.drawJointExtras = false
+	draw.debug_draw.drawBounds = false
+	draw.debug_draw.drawMass = false
+	draw.debug_draw.drawContacts = false
+	draw.debug_draw.drawGraphColors = false
+	draw.debug_draw.drawContactNormals = false
+	draw.debug_draw.drawContactImpulses = false
+	draw.debug_draw.drawContactFeatures = false
+	draw.debug_draw.drawFrictionImpulses = false
+	draw.debug_draw.drawIslands = false
+
+	draw.drawCounters = true
+
+	draw.debug_draw.userContext = rawptr(draw)
+
+}
+
