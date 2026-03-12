@@ -40,7 +40,6 @@ input_state :: struct
 
 /*
 	This will only be called once to initilize the engine
-	
 	initilize graphics library, glfw, callbacks
 */
 engine_init :: proc(state: ^engine_state) 

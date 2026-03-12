@@ -17,20 +17,24 @@ static_index_global :: struct
 	Don't put game's logic here
 */
 
+joint_common :: struct 
+{
+	entity_a, entity_b : static_index,
+	bodyIdA,  bodyIdB  : b2.BodyId,
+}
+
 revolt_joint_def :: struct 
 {
-	using def : b2.RevoluteJointDef,
-	
 	//Everything else can be stored in the def
 	entity_a, entity_b : static_index, 
+
+	using def : b2.RevoluteJointDef,
 }
 
 distance_joint_def :: struct 
 {
-	using def : b2.DistanceJointDef,
-	
-	//Everything else can be stored in the def
 	entity_a, entity_b : static_index, 
+	using def : b2.DistanceJointDef,
 }
 
 engine_world :: struct 
@@ -42,10 +46,15 @@ engine_world :: struct
 	relations               : map[^static_index][dynamic]static_index_global `cbor:"-"`,
 	relations_serializeable : map[ static_index][dynamic]static_index_global,
 	
+	/*
+		Seems okay to put the joint defs in engine rather than in game because
+		we don't add more attributes in joints in the game
+
+		Can be changed later without requireing refactor
+	*/
 	revolute_joint_defs     : [dynamic]revolt_joint_def,
 	distant_joint_defs      : [dynamic]distance_joint_def,
-	
-	revolute_joints         : [dynamic]b2.JointId,
+	joints                  : [dynamic]b2.JointId `cbor:"-"`,
 }
 
 engine_entity_flags_enum :: enum u64 {

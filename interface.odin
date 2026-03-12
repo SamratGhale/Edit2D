@@ -1,16 +1,18 @@
 package ion
-import "base:runtime"
 import "core:slice"
 import "core:container/small_array"
 import "core:fmt"
 import im "shared:odin-imgui"
-import "vendor:glfw"
 import b2 "vendor:box2d"
 
 /*
 This library will only account for box2d's entities editing
 
 It only deals with one world_id, which means typically one level
+
+All the interface follows a pattern
+i.e.  It takes interface_state pointer and returns a boolean indicating weather the world needs to be reloaded
+
 */
 
 EditMode :: enum 
@@ -18,23 +20,23 @@ EditMode :: enum
 	ENTITY,
 	VERTICES,
 	OVERVIEW,
+	JOINT,
 }
 
 interface_state :: struct 
 {
-	entity_defs:     [dynamic]^engine_entity_def,
-	entities:        [dynamic]^engine_entity,
-	selected_entity: ^i32,
-	world:           ^engine_world,
-	state:           ^engine_state,
-	
+	entity_defs       : [dynamic]^engine_entity_def,
+	entities          : [dynamic]^engine_entity,
+	selected_entity   : ^i32,
+	world             : ^engine_world,
+	state             : ^engine_state,
+
 	vertex_index      : ^i32,
 	edit_mode         : EditMode,
-	
-	curr_revolt_joint : revolt_joint_def,
 
-	curr_joint_joint  : distance_joint_def,
-	
+	curr_joint_index  : i32,
+	curr_joint_type   : b2.JointType,
+
 	curr_static_index : static_index_global,
 }
 
@@ -251,15 +253,15 @@ interface_edit_static_index :: proc(interface:^interface_state, def: ^engine_ent
 	return false
 }
 
+/*
 interface_edit_revolute_joint :: proc(interface: ^interface_state) -> bool
 {
-	
 	//Select static index and then get bodyId from it
 	//If chain shapre then allow choosing index
 	
 	level := interface.world
 	
-	joint_def := &interface.curr_revolt_joint
+	joint_def := interface.curr_revolt_joint
 	
 	if im.BeginCombo("Index A", fmt.ctprint(joint_def.entity_a))
 	{
@@ -317,13 +319,14 @@ interface_edit_revolute_joint :: proc(interface: ^interface_state) -> bool
 	
 	if im.Button("Add joint")
 	{
-		append(&level.revolute_joint_defs, interface.curr_revolt_joint)
+		//append(&level.revolute_joint_defs, interface.curr_revolt_joint)
 		return true
 	}
 	
 	
 	return false
 }
+*/
 
 
 interface_entity :: proc(interface: ^interface_state) -> bool 
@@ -333,14 +336,14 @@ interface_entity :: proc(interface: ^interface_state) -> bool
 	
 	if entity_selected
 	{
-		def := interface.entity_defs[interface.selected_entity^]
+		def     := interface.entity_defs[interface.selected_entity^]
 		def_old := def^
 		
 		ret := false
 
 		if im.BeginTabItem("Entity", nil, {.Leading}) 
 		{
-			
+			interface.edit_mode = .ENTITY
 			//Flags
 			for flag in engine_entity_flags_enum
 			{
@@ -375,12 +378,26 @@ interface_entity :: proc(interface: ^interface_state) -> bool
 		
 		if im.BeginTabItem("Joints", nil , {})
 		{
-			
-			if im.CollapsingHeader("Revolute Joints")
+			interface.edit_mode = .JOINT
+
+			if im.BeginCombo("Joint type", fmt.ctprint(interface.curr_joint_type))
+			{
+				for type in b2.JointType
+				{
+					if im.Selectable(fmt.ctprint(type), type == interface.curr_joint_type) do interface.curr_joint_type = type
+				}
+				im.EndCombo()
+			}
+
+
+			if interface.curr_joint_type == .distanceJoint
+			{
+				ret |= interface_edit_distance_joint(interface)
+			}
+			if interface.curr_joint_type == .revoluteJoint
 			{
 				ret |= interface_edit_revolute_joint(interface)
 			}
-			
 			im.EndTabItem()
 		}
 		
@@ -407,3 +424,10 @@ interface_all :: proc(interface: ^interface_state) -> bool
 	im.End()
 	return ret
 }
+
+
+
+
+
+
+
